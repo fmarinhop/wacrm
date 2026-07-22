@@ -218,6 +218,23 @@ export async function connectChannel(
     webhookId = existing?.session_id === sessionId ? webhookId : null
   }
 
+  // Persist the session_id BEFORE registering the webhook + starting, so
+  // the row exists when the very first `session.qr` event arrives — the
+  // gateway starts emitting QRs within milliseconds of start(), which
+  // could otherwise race ahead of the final upsert below and get dropped
+  // by the webhook handler as "no config for session".
+  await db.from('openwa_config').upsert(
+    {
+      account_id: accountId,
+      user_id: userId,
+      session_id: sessionId,
+      session_name: name,
+      status: 'connecting',
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'account_id' },
+  )
+
   // ---- 2. Ensure our webhook subscription exists ---------------
   if (!webhookId) {
     const webhook = await registerWebhook({

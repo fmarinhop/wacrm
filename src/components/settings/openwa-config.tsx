@@ -271,7 +271,23 @@ export function OpenWAConfig() {
             {state.qr_code ? (
               <>
                 <div className="rounded-md bg-white p-3">
-                  <QRCodeSVG value={state.qr_code} size={224} marginSize={0} />
+                  {/* The OpenWA gateway may deliver the QR either as a raw
+                      string to encode OR as an already-rendered PNG data
+                      URL (`data:image/...`). Re-encoding a multi-KB data
+                      URL through QRCodeSVG overflows the QR capacity and
+                      throws, so render pre-rendered images as-is and only
+                      encode raw strings. */}
+                  {/^data:image\//.test(state.qr_code) ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={state.qr_code}
+                      alt="WhatsApp QR code"
+                      width={224}
+                      height={224}
+                    />
+                  ) : (
+                    <QRCodeSVG value={state.qr_code} size={224} marginSize={0} />
+                  )}
                 </div>
                 <ol className="list-decimal space-y-1 pl-5 text-sm text-muted-foreground">
                   <li>{t('scanStep1')}</li>
