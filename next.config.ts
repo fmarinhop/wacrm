@@ -4,6 +4,30 @@ import createNextIntlPlugin from "next-intl/plugin";
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 
 /**
+ * Supabase origin for CSP. Defaults to the managed `*.supabase.co`
+ * wildcard, but a self-hosted deployment serves Supabase from its own
+ * domain (e.g. https://supabase-northub.mmconsult.com.br). Deriving the
+ * host from NEXT_PUBLIC_SUPABASE_URL at build time keeps the CSP correct
+ * in both cases — important once the policy is flipped from Report-Only
+ * to enforced. Falls back to the wildcard when the env var is unset
+ * (e.g. `next build` in CI without a project).
+ */
+function supabaseCspSources(): { http: string; ws: string } {
+  const fallback = { http: "https://*.supabase.co", ws: "wss://*.supabase.co" };
+  const raw = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  if (!raw) return fallback;
+  try {
+    const { protocol, host } = new URL(raw);
+    const ws = protocol === "https:" ? `wss://${host}` : `ws://${host}`;
+    return { http: `${protocol}//${host}`, ws };
+  } catch {
+    return fallback;
+  }
+}
+
+const SUPABASE_CSP = supabaseCspSources();
+
+/**
  * Baseline security headers applied to every response.
  *
  * CSP ships as `Content-Security-Policy-Report-Only` so the browser
@@ -51,11 +75,13 @@ const SECURITY_HEADERS = [
       "img-src 'self' data: blob: https:",
       // Outbound media previews (blob: from MediaRecorder + file picker)
       // and Supabase public-bucket audio/video the inbox renders.
-      "media-src 'self' blob: https://*.supabase.co",
+      `media-src 'self' blob: ${SUPABASE_CSP.http}`,
       "font-src 'self' data:",
-      // Supabase REST + realtime (WSS). All Meta API calls happen
-      // server-side, so graph.facebook.com does not belong here.
-      "connect-src 'self' https://*.supabase.co wss://*.supabase.co",
+      // Supabase REST + realtime (WSS). Host derived from
+      // NEXT_PUBLIC_SUPABASE_URL so self-hosted deployments work. All
+      // Meta / OpenWA API calls happen server-side, so those hosts do
+      // not belong here.
+      `connect-src 'self' ${SUPABASE_CSP.http} ${SUPABASE_CSP.ws}`,
       "frame-ancestors 'none'",
       "base-uri 'self'",
       "form-action 'self'",
@@ -64,6 +90,15 @@ const SECURITY_HEADERS = [
 ] as const;
 
 const nextConfig: NextConfig = {
+  /**
+   * Standalone output for containerized deploys (Docker/Kubernetes).
+   * Bundles a minimal `.next/standalone` server with only the runtime
+   * deps traced from the build, so the image doesn't ship all of
+   * node_modules. The repo's original Hostinger target ran `next start`;
+   * this is additive and doesn't affect that path.
+   */
+  output: "standalone",
+
   /**
    * Cross-origin dev access (Next.js 16).
    *

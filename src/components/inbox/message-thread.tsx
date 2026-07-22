@@ -23,6 +23,7 @@ import {
   UserPlus,
   Check,
   Clock,
+  QrCode,
   ArrowLeft,
   RefreshCw,
   PanelRightOpen,
@@ -902,17 +903,29 @@ export function MessageThread({
             <p className="truncate text-xs text-muted-foreground">{contact.phone}</p>
           </div>
           {/* Session timer badge — hidden on the narrowest phones so
-              the name + back arrow keep their room. */}
-          <Badge
-            variant="outline"
-            className={cn(
-              "ml-1 hidden gap-1 border-border text-[10px] sm:inline-flex sm:ml-2",
-              sessionInfo.expired ? "text-red-400" : "text-primary"
-            )}
-          >
-            <Clock className="h-3 w-3" />
-            {sessionInfo.remaining}
-          </Badge>
+              the name + back arrow keep their room. The unofficial
+              channel has no 24h window; it shows a channel badge
+              instead of a countdown. */}
+          {conversation.channel === "openwa" ? (
+            <Badge
+              variant="outline"
+              className="ml-1 hidden gap-1 border-border text-[10px] text-amber-500 sm:inline-flex sm:ml-2"
+            >
+              <QrCode className="h-3 w-3" />
+              {t("channelUnofficial")}
+            </Badge>
+          ) : (
+            <Badge
+              variant="outline"
+              className={cn(
+                "ml-1 hidden gap-1 border-border text-[10px] sm:inline-flex sm:ml-2",
+                sessionInfo.expired ? "text-red-400" : "text-primary"
+              )}
+            >
+              <Clock className="h-3 w-3" />
+              {sessionInfo.remaining}
+            </Badge>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
@@ -1152,7 +1165,10 @@ export function MessageThread({
       {/* Composer */}
       <MessageComposer
         conversationId={conversation.id}
-        sessionExpired={sessionInfo.expired}
+        channel={conversation.channel ?? "official"}
+        sessionExpired={
+          conversation.channel === "openwa" ? false : sessionInfo.expired
+        }
         onSend={handleSend}
         onSendMedia={handleSendMedia}
         onSendInteractive={handleSendInteractive}

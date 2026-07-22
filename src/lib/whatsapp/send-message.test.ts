@@ -157,3 +157,197 @@ describe('SendMessageError', () => {
     expect(e).toBeInstanceOf(Error);
   });
 });
+
+// ============================================================
+// Unofficial-channel dispatch (conversation.channel === 'openwa').
+//
+// A minimal chainable Supabase stub: every query-builder method returns
+// the chain; the terminators (.single/.maybeSingle) and `await chain`
+// resolve canned per-table results. The OpenWA HTTP hop is a stubbed
+// global fetch — these tests assert the send core routes by channel,
+// not the gateway client internals (openwa-api.test.ts owns those).
+// ============================================================
+
+vi.mock('@/lib/flows/admin-client', () => ({
+  supabaseAdmin: () => makeFakeDb({}),
+}));
+
+interface FakeTableResults {
+  single?: { data: unknown; error: unknown };
+  maybeSingle?: { data: unknown; error: unknown };
+  insertSingle?: { data: unknown; error: unknown };
+}
+
+function makeFakeDb(tables: Record<string, FakeTableResults>) {
+  return {
+    from(table: string) {
+      const results = tables[table] ?? {};
+      let inserting = false;
+      const chain: Record<string, unknown> = {};
+      const self = () => chain;
+      for (const m of ['select', 'eq', 'in', 'order', 'limit', 'update']) {
+        chain[m] = self;
+      }
+      chain.insert = () => {
+        inserting = true;
+        return chain;
+      };
+      chain.single = () =>
+        Promise.resolve(
+          (inserting ? results.insertSingle : results.single) ?? {
+            data: null,
+            error: { message: `no stub for ${table}.single` },
+          }
+        );
+      chain.maybeSingle = () =>
+        Promise.resolve(
+          results.maybeSingle ?? { data: null, error: null }
+        );
+      // Awaiting the bare chain (update/insert without .select()).
+      chain.then = (
+        resolve: (v: { data: null; error: null }) => unknown,
+        reject?: (e: unknown) => unknown
+      ) => Promise.resolve({ data: null, error: null }).then(resolve, reject);
+      return chain;
+    },
+  } as unknown as SupabaseClient;
+}
+
+const OPENWA_CONVERSATION = {
+  id: 'cv-1',
+  account_id: 'acct-1',
+  channel: 'openwa',
+  unread_count: 0,
+  contact: { id: 'ct-1', phone: '+5511999998888' },
+};
+
+describe('sendMessageToConversation — openwa channel dispatch', () => {
+  it('rejects template sends with a clear channel error', async () => {
+    const db = makeFakeDb({
+      conversations: { single: { data: OPENWA_CONVERSATION, error: null } },
+    });
+
+    await expect(
+      sendMessageToConversation(db, 'acct-1', {
+        conversationId: 'cv-1',
+        messageType: 'template',
+        templateName: 'welcome',
+      })
+    ).rejects.toMatchObject({
+      code: 'channel_unsupported',
+      status: 400,
+    });
+  });
+
+  it('rejects interactive sends on the unofficial channel', async () => {
+    const db = makeFakeDb({
+      conversations: { single: { data: OPENWA_CONVERSATION, error: null } },
+    });
+
+    await expect(
+      sendMessageToConversation(db, 'acct-1', {
+        conversationId: 'cv-1',
+        messageType: 'interactive',
+        interactivePayload: {
+          kind: 'buttons',
+          body: 'Pick one',
+          buttons: [{ id: 'a', title: 'A' }],
+        },
+      })
+    ).rejects.toMatchObject({ code: 'channel_unsupported', status: 400 });
+  });
+
+  it('refuses to send when the channel is not connected', async () => {
+    const db = makeFakeDb({
+      conversations: { single: { data: OPENWA_CONVERSATION, error: null } },
+      openwa_config: {
+        maybeSingle: {
+          data: { session_id: 'sess-1', status: 'disconnected' },
+          error: null,
+        },
+      },
+    });
+
+    await expect(
+      sendMessageToConversation(db, 'acct-1', {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'hi',
+      })
+    ).rejects.toMatchObject({ code: 'openwa_not_connected', status: 409 });
+  });
+
+  it('sends text through the gateway and persists the message', async () => {
+    const db = makeFakeDb({
+      conversations: { single: { data: OPENWA_CONVERSATION, error: null } },
+      openwa_config: {
+        maybeSingle: {
+          data: { session_id: 'sess-1', status: 'connected' },
+          error: null,
+        },
+      },
+      messages: {
+        insertSingle: { data: { id: 'msg-row-1' }, error: null },
+      },
+    });
+
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ messageId: 'true_55@c.us_XYZ', timestamp: 1700000000 }),
+        { status: 201, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const result = await sendMessageToConversation(db, 'acct-1', {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'hello there',
+      });
+
+      expect(result).toEqual({
+        messageId: 'msg-row-1',
+        whatsappMessageId: 'true_55@c.us_XYZ',
+      });
+
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe(
+        'http://openwa.test/api/sessions/sess-1/messages/send-text'
+      );
+      expect(JSON.parse(init.body)).toEqual({
+        chatId: '5511999998888@c.us',
+        text: 'hello there',
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('maps a gateway failure to a 502 openwa_error', async () => {
+    const db = makeFakeDb({
+      conversations: { single: { data: OPENWA_CONVERSATION, error: null } },
+      openwa_config: {
+        maybeSingle: {
+          data: { session_id: 'sess-1', status: 'connected' },
+          error: null,
+        },
+      },
+    });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockRejectedValue(new Error('ECONNREFUSED'))
+    );
+    try {
+      await expect(
+        sendMessageToConversation(db, 'acct-1', {
+          conversationId: 'cv-1',
+          messageType: 'text',
+          contentText: 'hi',
+        })
+      ).rejects.toMatchObject({ code: 'openwa_error', status: 502 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});

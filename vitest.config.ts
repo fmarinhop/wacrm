@@ -15,6 +15,9 @@ export default defineConfig({
       ENCRYPTION_KEY:
         "0000000000000000000000000000000000000000000000000000000000000000",
       META_APP_SECRET: "test-meta-app-secret",
+      OPENWA_WEBHOOK_SECRET: "test-openwa-webhook-secret",
+      OPENWA_BASE_URL: "http://openwa.test/api",
+      OPENWA_API_KEY: "owa_test_key",
     },
     clearMocks: true,
   },

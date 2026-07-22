@@ -10,12 +10,115 @@ import {
 import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
+  sendText as openwaSendText,
+  sendMedia as openwaSendMedia,
+  phoneToChatId,
+  type OpenWAMediaKind,
+} from '@/lib/openwa/openwa-api'
+import {
   sanitizePhoneForMeta,
   isValidE164,
   phoneVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
 import { supabaseAdmin } from './admin-client'
+
+// ------------------------------------------------------------
+// Channel awareness (migration 037). Engine sends carry a
+// conversationId, and that conversation's `channel` decides the
+// transport: 'official' → the Meta paths below, 'openwa' → the shared
+// OpenWA gateway session. Text and media translate 1:1; interactive
+// buttons/lists are Cloud-API-only constructs, so flows using those
+// nodes fail loudly on an openwa thread instead of silently degrading.
+// ------------------------------------------------------------
+
+/** Exported for automations/meta-send.ts, which shares the same dispatch. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function conversationChannel(db: any, conversationId: string): Promise<string> {
+  const { data } = await db
+    .from('conversations')
+    .select('channel')
+    .eq('id', conversationId)
+    .maybeSingle()
+  return (data?.channel as string | undefined) ?? 'official'
+}
+
+/**
+ * Send text or media through the account's OpenWA session and persist
+ * it as a bot message — the openwa twin of the Meta engine senders.
+ */
+export async function engineSendViaOpenWA(args: {
+  accountId: string
+  conversationId: string
+  chatId: string
+  kind: 'text' | OpenWAMediaKind
+  text?: string
+  link?: string
+  caption?: string
+  filename?: string
+  aiGenerated?: boolean
+}): Promise<{ whatsapp_message_id: string }> {
+  const db = supabaseAdmin()
+
+  const { data: config, error: configErr } = await db
+    .from('openwa_config')
+    .select('session_id, status')
+    .eq('account_id', args.accountId)
+    .maybeSingle()
+  if (configErr || !config?.session_id) {
+    throw new Error('Unofficial WhatsApp channel not configured for this account')
+  }
+  if (config.status !== 'connected') {
+    throw new Error(`Unofficial WhatsApp channel is ${config.status}`)
+  }
+
+  let waMessageId: string
+  if (args.kind === 'text') {
+    const r = await openwaSendText({
+      sessionId: config.session_id,
+      chatId: args.chatId,
+      text: args.text ?? '',
+    })
+    waMessageId = r.messageId
+  } else {
+    const r = await openwaSendMedia({
+      sessionId: config.session_id,
+      chatId: args.chatId,
+      kind: args.kind,
+      url: args.link!,
+      caption: args.caption,
+      filename: args.filename,
+    })
+    waMessageId = r.messageId
+  }
+
+  const preview =
+    args.kind === 'text' ? (args.text ?? '') : args.caption?.trim() || `[${args.kind}]`
+  const { error: msgErr } = await db.from('messages').insert({
+    conversation_id: args.conversationId,
+    sender_type: 'bot',
+    content_type: args.kind,
+    content_text: args.kind === 'text' ? (args.text ?? '') : (args.caption ?? null),
+    ...(args.kind !== 'text' ? { media_url: args.link ?? null } : {}),
+    message_id: waMessageId,
+    status: 'sent',
+    ...(args.kind === 'text' ? { ai_generated: args.aiGenerated ?? false } : {}),
+  })
+  if (msgErr) {
+    throw new Error(`sent via OpenWA but DB insert failed: ${msgErr.message}`)
+  }
+
+  await db
+    .from('conversations')
+    .update({
+      last_message_text: preview,
+      last_message_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', args.conversationId)
+
+  return { whatsapp_message_id: waMessageId }
+}
 
 // ------------------------------------------------------------
 // Flows-side Meta sender (interactive variants).
@@ -80,6 +183,17 @@ export async function engineSendText(
   const sanitized = sanitizePhoneForMeta(contact.phone)
   if (!isValidE164(sanitized)) {
     throw new Error(`contact phone invalid: ${contact.phone}`)
+  }
+
+  if ((await conversationChannel(db, args.conversationId)) === 'openwa') {
+    return engineSendViaOpenWA({
+      accountId: args.accountId,
+      conversationId: args.conversationId,
+      chatId: phoneToChatId(sanitized),
+      kind: 'text',
+      text: args.text,
+      aiGenerated: args.aiGenerated,
+    })
   }
 
   const { data: config, error: configErr } = await db
@@ -190,6 +304,18 @@ export async function engineSendMedia(
   const sanitized = sanitizePhoneForMeta(contact.phone)
   if (!isValidE164(sanitized)) {
     throw new Error(`contact phone invalid: ${contact.phone}`)
+  }
+
+  if ((await conversationChannel(db, args.conversationId)) === 'openwa') {
+    return engineSendViaOpenWA({
+      accountId: args.accountId,
+      conversationId: args.conversationId,
+      chatId: phoneToChatId(sanitized),
+      kind: args.kind as OpenWAMediaKind,
+      link: args.link,
+      caption: args.caption,
+      filename: args.filename,
+    })
   }
 
   const { data: config, error: configErr } = await db
@@ -325,6 +451,12 @@ async function sendInteractiveViaMeta(
   input: SendInput,
 ): Promise<{ whatsapp_message_id: string }> {
   const db = supabaseAdmin()
+
+  if ((await conversationChannel(db, input.conversationId)) === 'openwa') {
+    throw new Error(
+      'Interactive messages are only available on the official (Meta Cloud API) channel — this conversation uses the unofficial QR channel',
+    )
+  }
 
   // Scope the contact + whatsapp_config lookups by account_id —
   // same defense-in-depth rationale as automations/meta-send.ts.

@@ -3,7 +3,10 @@ import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
 import {
   engineSendInteractiveButtons,
   engineSendInteractiveList,
+  engineSendViaOpenWA,
+  conversationChannel,
 } from '@/lib/flows/meta-send'
+import { phoneToChatId } from '@/lib/openwa/openwa-api'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
   sanitizePhoneForMeta,
@@ -129,6 +132,23 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   const sanitized = sanitizePhoneForMeta(contact.phone)
   if (!isValidE164(sanitized)) {
     throw new Error(`contact phone invalid: ${contact.phone}`)
+  }
+
+  // Channel dispatch (migration 037): openwa threads answer through the
+  // gateway. Templates are Cloud-API-only — fail loudly, not silently.
+  if ((await conversationChannel(db, input.conversationId)) === 'openwa') {
+    if (input.kind === 'template') {
+      throw new Error(
+        'Template messages are only available on the official (Meta Cloud API) channel — this conversation uses the unofficial QR channel',
+      )
+    }
+    return engineSendViaOpenWA({
+      accountId: input.accountId,
+      conversationId: input.conversationId,
+      chatId: phoneToChatId(sanitized),
+      kind: 'text',
+      text: input.text,
+    })
   }
 
   const { data: config, error: configErr } = await db

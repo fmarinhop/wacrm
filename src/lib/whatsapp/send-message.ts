@@ -35,6 +35,12 @@ import {
   type InteractiveMessagePayload,
 } from '@/lib/whatsapp/interactive';
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption';
+import {
+  sendText as openwaSendText,
+  sendMedia as openwaSendMedia,
+  phoneToChatId,
+  type OpenWAMediaKind,
+} from '@/lib/openwa/openwa-api';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
 import {
   sanitizePhoneForMeta,
@@ -247,6 +253,25 @@ export async function sendMessageToConversation(
     );
   }
 
+  // Channel dispatch. The conversation's channel (migration 037) is
+  // authoritative: an 'openwa' thread was opened by the unofficial
+  // gateway and MUST be answered through it — the customer texted that
+  // number, not the Meta one. Everything above (validation, conversation
+  // + contact load, phone sanitation) is channel-agnostic; everything
+  // below this block is the original Meta path, untouched.
+  if (conversation.channel === 'openwa') {
+    return sendViaOpenWA(db, accountId, {
+      conversationId,
+      contactId: contact.id,
+      sanitizedPhone,
+      messageType,
+      contentText,
+      mediaUrl,
+      filename,
+      replyToMessageId,
+    });
+  }
+
   // WhatsApp config, account-scoped.
   const { data: config, error: configError } = await db
     .from('whatsapp_config')
@@ -440,17 +465,24 @@ export async function sendMessageToConversation(
       .eq('id', contact.id);
   }
 
-  // Persist the sent message. Field names MUST match the messages
-  // schema (see 001_initial_schema.sql).
-  // Interactive messages persist the body as content_text (so the
-  // conversation-list preview reads sensibly) plus the full structured
-  // payload so the thread can re-render the buttons / rows.
+  // Persist the sent message. Interactive messages persist the body as
+  // content_text (so the conversation-list preview reads sensibly) plus
+  // the full structured payload so the thread can re-render the
+  // buttons / rows.
   const interactiveBody =
     messageType === 'interactive' ? interactivePayload!.body : null;
 
-  const { data: messageRecord, error: msgError } = await db
-    .from('messages')
-    .insert({
+  const lastMessageText =
+    messageType === 'interactive'
+      ? interactivePayloadPreviewText(interactivePayload!)
+      : contentText || `[${messageType}]`;
+
+  return persistOutboundMessage(db, accountId, {
+    conversationId,
+    contactId: contact.id,
+    waMessageId,
+    lastMessageText,
+    insertRow: {
       conversation_id: conversationId,
       sender_type: 'agent',
       content_type: messageType,
@@ -462,7 +494,33 @@ export async function sendMessageToConversation(
       message_id: waMessageId,
       status: 'sent',
       reply_to_message_id: replyToMessageId || null,
-    })
+    },
+  });
+}
+
+// ------------------------------------------------------------
+// Shared post-send tail: persist the message row, refresh the
+// conversation summary, and pause any active Flow run (the agent
+// stepping in is the strongest "yield, human is here" signal).
+// Field names MUST match the messages schema (001_initial_schema.sql).
+// ------------------------------------------------------------
+async function persistOutboundMessage(
+  db: SupabaseClient,
+  accountId: string,
+  args: {
+    conversationId: string;
+    contactId: string;
+    waMessageId: string;
+    lastMessageText: string;
+    insertRow: Record<string, unknown>;
+  }
+): Promise<SendMessageResult> {
+  const { conversationId, contactId, waMessageId, lastMessageText, insertRow } =
+    args;
+
+  const { data: messageRecord, error: msgError } = await db
+    .from('messages')
+    .insert(insertRow)
     .select()
     .single();
 
@@ -470,15 +528,10 @@ export async function sendMessageToConversation(
     console.error('[send-message] error inserting sent message:', msgError);
     throw new SendMessageError(
       'db_error',
-      `Message sent to Meta but failed to save to DB: ${msgError.message}`,
+      `Message sent but failed to save to DB: ${msgError.message}`,
       500
     );
   }
-
-  const lastMessageText =
-    messageType === 'interactive'
-      ? interactivePayloadPreviewText(interactivePayload!)
-      : contentText || `[${messageType}]`;
 
   await db
     .from('conversations')
@@ -489,8 +542,6 @@ export async function sendMessageToConversation(
     })
     .eq('id', conversationId);
 
-  // Pause any active Flow run for this contact — the agent stepping in
-  // is the strongest "yield, human is here" signal. Best-effort.
   try {
     const { error: pauseErr } = await supabaseAdmin()
       .from('flow_runs')
@@ -500,7 +551,7 @@ export async function sendMessageToConversation(
         end_reason: 'agent_replied',
       })
       .eq('account_id', accountId)
-      .eq('contact_id', contact.id)
+      .eq('contact_id', contactId)
       .eq('status', 'active');
     if (pauseErr) {
       console.error('[flows] pause-on-agent-send failed:', pauseErr.message);
@@ -513,4 +564,120 @@ export async function sendMessageToConversation(
   }
 
   return { messageId: messageRecord.id, whatsappMessageId: waMessageId };
+}
+
+// ------------------------------------------------------------
+// Unofficial-channel send (conversation.channel === 'openwa').
+//
+// Sends through the shared OpenWA gateway session instead of the Meta
+// Cloud API. Deliberately narrower than the Meta path: text + media
+// only. Templates and interactive messages are Cloud-API constructs —
+// they don't exist on WhatsApp Web, so those types 400 with an explicit
+// error instead of silently degrading. There's also no 24h-window rule
+// on this channel, hence no template fallback pressure.
+// ------------------------------------------------------------
+async function sendViaOpenWA(
+  db: SupabaseClient,
+  accountId: string,
+  args: {
+    conversationId: string;
+    contactId: string;
+    sanitizedPhone: string;
+    messageType: string;
+    contentText?: string | null;
+    mediaUrl?: string | null;
+    filename?: string | null;
+    replyToMessageId?: string | null;
+  }
+): Promise<SendMessageResult> {
+  const {
+    conversationId,
+    contactId,
+    sanitizedPhone,
+    messageType,
+    contentText,
+    mediaUrl,
+    filename,
+    replyToMessageId,
+  } = args;
+
+  if (messageType === 'template' || messageType === 'interactive') {
+    throw new SendMessageError(
+      'channel_unsupported',
+      `${messageType === 'template' ? 'Template' : 'Interactive'} messages are only available on the official (Meta Cloud API) channel — this conversation uses the unofficial QR channel.`,
+      400
+    );
+  }
+
+  const { data: config, error: configError } = await db
+    .from('openwa_config')
+    .select('session_id, status')
+    .eq('account_id', accountId)
+    .maybeSingle();
+
+  if (configError || !config?.session_id) {
+    throw new SendMessageError(
+      'openwa_not_configured',
+      'The unofficial WhatsApp channel is not configured for this account.',
+      400
+    );
+  }
+  if (config.status !== 'connected') {
+    throw new SendMessageError(
+      'openwa_not_connected',
+      `The unofficial WhatsApp channel is ${config.status} — reconnect it in Settings before sending.`,
+      409
+    );
+  }
+
+  const chatId = phoneToChatId(sanitizedPhone);
+  let waMessageId: string;
+  try {
+    if ((MEDIA_KINDS as readonly string[]).includes(messageType)) {
+      const result = await openwaSendMedia({
+        sessionId: config.session_id,
+        chatId,
+        kind: messageType as OpenWAMediaKind,
+        url: mediaUrl!,
+        caption: contentText || undefined,
+        filename: filename || undefined,
+      });
+      waMessageId = result.messageId;
+    } else {
+      const result = await openwaSendText({
+        sessionId: config.session_id,
+        chatId,
+        text: contentText!,
+      });
+      waMessageId = result.messageId;
+    }
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Unknown OpenWA gateway error';
+    console.error('[send-message] OpenWA send failed:', message);
+    throw new SendMessageError(
+      'openwa_error',
+      `OpenWA gateway error: ${message}`,
+      502
+    );
+  }
+
+  return persistOutboundMessage(db, accountId, {
+    conversationId,
+    contactId,
+    waMessageId,
+    lastMessageText: contentText || `[${messageType}]`,
+    insertRow: {
+      conversation_id: conversationId,
+      sender_type: 'agent',
+      content_type: messageType,
+      content_text: contentText ?? null,
+      media_url: mediaUrl || null,
+      message_id: waMessageId,
+      status: 'sent',
+      // Transport-level quoting isn't wired for this channel; the
+      // local link still renders the quote in the thread.
+      reply_to_message_id: replyToMessageId || null,
+    },
+  });
 }

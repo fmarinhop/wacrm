@@ -157,11 +157,20 @@ export interface ContactNote {
 
 export type ConversationStatus = 'open' | 'pending' | 'closed';
 
+/**
+ * Which transport a conversation belongs to (migration 037):
+ *  - 'official' — Meta WhatsApp Cloud API (whatsapp_config)
+ *  - 'openwa'   — unofficial QR channel via the OpenWA gateway
+ * Replies always route through the conversation's own channel.
+ */
+export type ConversationChannel = 'official' | 'openwa';
+
 export interface Conversation {
   id: string;
   user_id: string;
   contact_id: string;
   status: ConversationStatus;
+  channel?: ConversationChannel;
   assigned_agent_id?: string;
   last_message_text?: string;
   last_message_at?: string;

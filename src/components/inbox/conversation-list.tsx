@@ -9,7 +9,7 @@ import {
 } from "@/lib/inbox/conversations";
 import { cn } from "@/lib/utils";
 import type { Conversation, ConversationStatus, Tag } from "@/types";
-import { Search, ChevronDown, X } from "lucide-react";
+import { Search, ChevronDown, X, QrCode } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import { useTranslations } from "next-intl";
 import { Input } from "@/components/ui/input";
@@ -474,8 +474,18 @@ function ConversationItem({
       {/* Content */}
       <div className="min-w-0 flex-1">
         <div className="flex items-center justify-between gap-2">
-          <span className="truncate text-sm font-medium text-foreground">
-            {displayName}
+          <span className="flex min-w-0 items-center gap-1">
+            <span className="truncate text-sm font-medium text-foreground">
+              {displayName}
+            </span>
+            {/* Channel marker — only the unofficial (QR) channel gets an
+                icon; official threads stay visually unchanged. */}
+            {conversation.channel === "openwa" && (
+              <QrCode
+                className="h-3 w-3 shrink-0 text-amber-500"
+                aria-label={t("channelUnofficial")}
+              />
+            )}
           </span>
           <span className="shrink-0 text-[10px] text-muted-foreground">{timeAgo}</span>
         </div>

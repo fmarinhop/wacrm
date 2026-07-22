@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+.env*
+!.env.local.example
+npm-debug.log*
+*.md
+docs
+supabase/.branches
+supabase/.temp
+coverage
+.vscode
+.idea
