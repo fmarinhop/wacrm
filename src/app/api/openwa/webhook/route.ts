@@ -3,7 +3,7 @@ import { createClient } from '@supabase/supabase-js'
 
 import { verifyOpenWAWebhookSignature } from '@/lib/openwa/webhook-signature'
 import { mapSessionStatus } from '@/lib/openwa/session-manager'
-import { chatIdToPhone } from '@/lib/openwa/openwa-api'
+import { chatIdToPhone, getSession } from '@/lib/openwa/openwa-api'
 import type { OpenWASessionStatus } from '@/lib/openwa/openwa-api'
 import { normalizePhone } from '@/lib/whatsapp/phone-utils'
 import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe'
@@ -132,6 +132,14 @@ type OpenWAConfigRow = any
  * Resolve the tenant from the gateway's session identifier. Depending
  * on gateway version the envelope's sessionId may be the session UUID
  * or its name — match either.
+ *
+ * Self-heal for UUID drift: the gateway assigns a NEW session UUID when
+ * it restarts (auto-starting a persisted session), but the session NAME
+ * (`wacrm-<account_id>`) is stable. When the incoming sessionId matches
+ * no stored row, we ask the gateway for that session's name, derive the
+ * account from it, and reconcile `openwa_config.session_id` — so the
+ * account's inbound traffic keeps flowing across gateway restarts
+ * instead of silently dropping as "no config for session".
  */
 async function resolveConfig(sessionId: string): Promise<OpenWAConfigRow | null> {
   const { data, error } = await supabaseAdmin()
@@ -143,10 +151,41 @@ async function resolveConfig(sessionId: string): Promise<OpenWAConfigRow | null>
     console.error('[openwa-webhook] config lookup failed:', error)
     return null
   }
-  if (!data) {
-    console.warn('[openwa-webhook] no config for session:', sessionId)
+  if (data) return data
+
+  try {
+    const session = await getSession({ sessionId })
+    const name = session?.name ?? ''
+    if (name.startsWith('wacrm-')) {
+      const accountId = name.slice('wacrm-'.length)
+      const { data: byName } = await supabaseAdmin()
+        .from('openwa_config')
+        .select('*')
+        .eq('account_id', accountId)
+        .maybeSingle()
+      if (byName) {
+        await supabaseAdmin()
+          .from('openwa_config')
+          .update({
+            session_id: sessionId,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('account_id', accountId)
+        console.log(
+          `[openwa-webhook] reconciled session_id for account ${accountId} → ${sessionId}`,
+        )
+        return { ...byName, session_id: sessionId }
+      }
+    }
+  } catch (err) {
+    console.error(
+      '[openwa-webhook] session reconcile failed:',
+      err instanceof Error ? err.message : err,
+    )
   }
-  return data
+
+  console.warn('[openwa-webhook] no config for session:', sessionId)
+  return null
 }
 
 async function processEvent(envelope: OpenWAWebhookEnvelope) {
