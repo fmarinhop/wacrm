@@ -3,7 +3,12 @@ import { createClient } from '@supabase/supabase-js'
 
 import { verifyOpenWAWebhookSignature } from '@/lib/openwa/webhook-signature'
 import { mapSessionStatus } from '@/lib/openwa/session-manager'
-import { chatIdToPhone, getSession } from '@/lib/openwa/openwa-api'
+import {
+  chatIdToPhone,
+  getSession,
+  getContact,
+  contactDisplayName,
+} from '@/lib/openwa/openwa-api'
 import type { OpenWASessionStatus } from '@/lib/openwa/openwa-api'
 import { normalizePhone } from '@/lib/whatsapp/phone-utils'
 import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe'
@@ -71,7 +76,7 @@ interface OpenWAIncomingMessage {
   isStatusBroadcast?: boolean
   isLidSender?: boolean
   senderPhone?: string | null
-  contact?: { pushName?: string; name?: string }
+  contact?: { pushName?: string; name?: string; verifiedName?: string }
   media?: {
     mimetype: string
     filename?: string
@@ -87,6 +92,15 @@ interface OpenWAAckPayload {
   id?: string
   messageId?: string
   status?: string
+}
+
+interface OpenWAReactionPayload {
+  /** Gateway message id of the message being reacted to. */
+  messageId: string
+  chatId?: string
+  /** The emoji; '' (empty) means the reaction was removed. */
+  reaction?: string
+  senderId?: string
 }
 
 export async function POST(request: Request) {
@@ -275,6 +289,13 @@ async function processEvent(envelope: OpenWAWebhookEnvelope) {
       return
     }
 
+    case 'message.reaction': {
+      const data = envelope.data as OpenWAReactionPayload | undefined
+      if (!data?.messageId) return
+      await handleReaction(config, data)
+      return
+    }
+
     default:
       // Unsubscribed/unknown event — ignore quietly.
       return
@@ -317,6 +338,68 @@ async function handleAck(ack: OpenWAAckPayload, forceFailed: boolean) {
 }
 
 // ------------------------------------------------------------
+// Reactions (emoji on a message)
+//
+// WhatsApp reactions are per-(target message, actor) state, not new
+// messages — mirror them into message_reactions like the Meta webhook
+// does. We attribute an inbound reaction to the conversation's contact
+// (the customer); an empty emoji is a removal.
+// ------------------------------------------------------------
+
+async function handleReaction(
+  config: OpenWAConfigRow,
+  data: OpenWAReactionPayload
+) {
+  // Resolve the target message (by gateway message_id) within this
+  // account's openwa conversations, and the contact who owns the thread.
+  const { data: rows, error } = await supabaseAdmin()
+    .from('messages')
+    .select('id, conversation_id, conversation:conversations!inner(account_id, contact_id, channel)')
+    .eq('message_id', data.messageId)
+    .eq('conversation.account_id', config.account_id)
+    .eq('conversation.channel', 'openwa')
+    .limit(1)
+
+  if (error) {
+    console.error('[openwa-webhook] reaction lookup failed:', error)
+    return
+  }
+  const target = rows?.[0]
+  if (!target) {
+    // We never stored the reacted-to message (e.g. it predates the CRM).
+    return
+  }
+  const conversation = target.conversation as { contact_id: string }
+  const actorId = conversation.contact_id
+  const emoji = data.reaction ?? ''
+
+  if (!emoji) {
+    const { error: delErr } = await supabaseAdmin()
+      .from('message_reactions')
+      .delete()
+      .eq('message_id', target.id)
+      .eq('actor_type', 'customer')
+      .eq('actor_id', actorId)
+    if (delErr) console.error('[openwa-webhook] reaction delete failed:', delErr)
+    return
+  }
+
+  const { error: upErr } = await supabaseAdmin()
+    .from('message_reactions')
+    .upsert(
+      {
+        message_id: target.id,
+        conversation_id: target.conversation_id,
+        actor_type: 'customer',
+        actor_id: actorId,
+        emoji,
+      },
+      { onConflict: 'message_id,actor_type,actor_id' }
+    )
+  if (upErr) console.error('[openwa-webhook] reaction upsert failed:', upErr)
+}
+
+// ------------------------------------------------------------
 // Inbound messages
 // ------------------------------------------------------------
 
@@ -348,9 +431,33 @@ async function processInboundMessage(
   const accountId: string = config.account_id
   const ownerUserId: string = config.user_id
 
-  const contactName = isEcho
-    ? phone
-    : (message.contact?.pushName ?? message.contact?.name ?? phone)
+  // Prefer the push name carried on the message. When it's absent (common
+  // for @lid senders), enrich from the gateway's contact cache so the
+  // inbox shows a real name instead of a bare number. Best-effort and
+  // only when we don't already have a name — bounded, cheap (cache read).
+  let resolvedName: string | null = isEcho
+    ? null
+    : (message.contact?.pushName ??
+       message.contact?.name ??
+       message.contact?.verifiedName ??
+       null)
+
+  if (!isEcho && !resolvedName && config.session_id) {
+    try {
+      const c = await getContact({
+        sessionId: config.session_id,
+        contactId: `${phone.replace(/\D/g, '')}@c.us`,
+      })
+      resolvedName = contactDisplayName(c)
+    } catch (err) {
+      console.warn(
+        '[openwa-webhook] contact enrichment failed:',
+        err instanceof Error ? err.message : err,
+      )
+    }
+  }
+
+  const contactName = resolvedName || phone
 
   const contactOutcome = await findOrCreateContact(
     accountId,
@@ -619,12 +726,24 @@ async function parseContent(
     }
   }
 
+  // A human-readable label per media kind, used when the media couldn't
+  // be downloaded (mediaUrl null) so the bubble shows "[imagem]" instead
+  // of a blank row. whatsapp-web.js fails to fetch some inbound media
+  // ("Getter was called with undefined data"), most often for history-
+  // sync messages — the label keeps those visible in the thread.
+  const MEDIA_LABEL: Record<string, string> = {
+    image: '[imagem]',
+    video: '[vídeo]',
+    audio: '[áudio]',
+    document: '[documento]',
+  }
+
   // For media, `body` carries the caption. For documents fall back to
   // the filename so the bubble has a label even without a caption.
   const contentText =
     message.body?.trim() ||
     (contentType === 'document' ? (message.media?.filename ?? null) : null) ||
-    (hasMedia && message.media?.omitted ? '[media unavailable]' : null)
+    (contentType in MEDIA_LABEL && !mediaUrl ? MEDIA_LABEL[contentType] : null)
 
   return {
     contentText: contentType === 'text' ? (message.body ?? null) : contentText,

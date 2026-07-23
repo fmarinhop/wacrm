@@ -209,6 +209,50 @@ export async function getQRCode(args: {
 }
 
 // ------------------------------------------------------------
+// Contacts — best-effort profile enrichment (name/pushName). The
+// gateway resolves these from the WhatsApp Web cache; used to fill a
+// contact's name when the inbound message didn't carry a push name.
+// ------------------------------------------------------------
+
+export interface OpenWAContact {
+  id?: string
+  name?: string
+  pushName?: string
+  /** wwebjs raw field spelling. */
+  pushname?: string
+  shortName?: string
+  verifiedName?: string
+  number?: string
+  isBusiness?: boolean
+}
+
+/** Pick the friendliest available display name, or null. */
+export function contactDisplayName(c: OpenWAContact | null): string | null {
+  if (!c) return null
+  return (
+    c.pushName || c.pushname || c.verifiedName || c.name || c.shortName || null
+  )
+}
+
+export async function getContact(args: {
+  sessionId: string
+  contactId: string
+}): Promise<OpenWAContact | null> {
+  try {
+    return await openwaFetch<OpenWAContact>(
+      'GET',
+      `/sessions/${args.sessionId}/contacts/${encodeURIComponent(args.contactId)}`,
+    )
+  } catch (err) {
+    // Unknown/not-a-contact → no enrichment, not a hard failure.
+    if (err instanceof OpenWAApiError && (err.status === 404 || err.status === 400)) {
+      return null
+    }
+    throw err
+  }
+}
+
+// ------------------------------------------------------------
 // Webhook subscriptions (per session)
 // ------------------------------------------------------------
 
@@ -238,6 +282,18 @@ export async function deleteWebhook(args: {
   await openwaFetch<unknown>(
     'DELETE',
     `/sessions/${args.sessionId}/webhooks/${args.webhookId}`,
+  )
+}
+
+export async function updateWebhook(args: {
+  sessionId: string
+  webhookId: string
+  events: string[]
+}): Promise<void> {
+  await openwaFetch<unknown>(
+    'PUT',
+    `/sessions/${args.sessionId}/webhooks/${args.webhookId}`,
+    { events: args.events },
   )
 }
 

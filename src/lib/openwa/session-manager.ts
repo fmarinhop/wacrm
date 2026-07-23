@@ -32,6 +32,7 @@ import {
   deleteSession,
   registerWebhook,
   deleteWebhook,
+  updateWebhook,
   OpenWAApiError,
   type OpenWASessionStatus,
 } from '@/lib/openwa/openwa-api'
@@ -81,6 +82,8 @@ const WEBHOOK_EVENTS = [
   'message.sent',
   'message.ack',
   'message.failed',
+  // Emoji reactions on a message (👍 etc.) — stored in message_reactions.
+  'message.reaction',
 ]
 
 export class OpenWAChannelError extends Error {
@@ -245,6 +248,19 @@ export async function connectChannel(
       retryCount: 3,
     })
     webhookId = webhook.id
+  } else {
+    // Re-assert the event list on an already-registered webhook so a
+    // reconnect picks up newly-added events (e.g. message.reaction)
+    // without the operator having to remove + recreate the channel.
+    // Best-effort — a failure here shouldn't block reconnect.
+    try {
+      await updateWebhook({ sessionId, webhookId, events: WEBHOOK_EVENTS })
+    } catch (err) {
+      console.warn(
+        '[openwa] webhook event re-assert failed (continuing):',
+        err instanceof Error ? err.message : err,
+      )
+    }
   }
 
   // ---- 3. Start the session (tolerate "already started") -------
