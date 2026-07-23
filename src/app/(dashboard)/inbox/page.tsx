@@ -200,13 +200,26 @@ function InboxPageInner() {
         return;
       }
 
-      const { data } = await supabase
-        .from("whatsapp_config")
-        .select("status")
-        .eq("account_id", accountId)
-        .maybeSingle();
+      // The inbox is usable if EITHER channel is connected: the official
+      // Meta config (whatsapp_config) or the unofficial OpenWA channel
+      // (openwa_config). Querying only the former showed the "not
+      // connected" banner for accounts running solely on the QR channel.
+      const [{ data: official }, { data: openwa }] = await Promise.all([
+        supabase
+          .from("whatsapp_config")
+          .select("status")
+          .eq("account_id", accountId)
+          .maybeSingle(),
+        supabase
+          .from("openwa_config")
+          .select("status")
+          .eq("account_id", accountId)
+          .maybeSingle(),
+      ]);
 
-      setWhatsappConnected(data?.status === "connected");
+      setWhatsappConnected(
+        official?.status === "connected" || openwa?.status === "connected"
+      );
     };
 
     checkConnection();
